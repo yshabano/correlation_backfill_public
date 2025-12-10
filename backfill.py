@@ -8,42 +8,197 @@ import os
 import re
 import math
 from datetime import datetime, timezone
+import splunklib.client as client
+from pathlib import Path
+import getpass
 
 ################################################################
 # ==============================================================
-# Configurations
+# Authentication Helpers
 # ==============================================================
-with open("config.json") as config_file:
-    config = json.load(config_file)
+_SPLUNK_AUTH = None
+def get_splunk_auth():
+    """Prompt once per run for SPLUNK_USER password; cache in memory."""
+    global _SPLUNK_AUTH
+    if _SPLUNK_AUTH is not None:
+        return _SPLUNK_AUTH
+    splunk_user = SPLUNK_USER
+    splunk_pass = getpass.getpass(
+        f"\n\n##### Enter password for Splunk user '{splunk_user}' (input hidden): "
+    ).strip()
+    print("\n")
+    _SPLUNK_AUTH = (splunk_user, splunk_pass)
+    return _SPLUNK_AUTH
 
+def get_hec_token():
+    """Resolve HEC token from storage/passwords using the Splunk user credentials."""
+    return get_secret(config["HEC_TOKEN_SECRET"])
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"config.json not found at {CONFIG_PATH}")
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=4)
+    print(f"[INFO] Updated {CONFIG_PATH}")
+
+def secure_my_creds(cfg):
+    splunk_server = cfg.get("SPLUNK_SERVER")
+    print("=== One-time credential setup for backfill ===")
+
+    # Admin creds, used only to write the HEC token into storage/passwords
+    admin_user = input("Splunk admin username (for 8089 REST): ").strip()
+    admin_pass = getpass.getpass("Splunk admin password (input hidden): ").strip()
+
+    # Connect as admin via SDK
+    host = splunk_server.replace("https://", "").replace("http://", "").split(":")[0]
+    port = 8089
+    service = client.connect(
+        host=host,
+        port=port,
+        scheme="https",
+        username=admin_user,
+        password=admin_pass,
+        owner="nobody",
+        app="search",
+    )
+
+    # Splunk user for REST (just record the username; do NOT store password)
+    splunk_user = input("Splunk user (for 8089 REST): ").strip()
+    cfg["SPLUNK_USER"] = splunk_user
+
+    # HEC token -> storage/passwords via SDK (one-time write)
+    hec_token = getpass.getpass("\n\n##### Enter HEC token (input hidden): ").strip()
+    print("\n")
+    # If already exists, you may want to delete or skip; for now just try to create
+    service.storage_passwords.create(
+        password=hec_token,
+        realm="backfill_hec",
+        username="hec_token",
+    )
+
+    # Remove any old cleartext fields
+    cfg.pop("SPLUNKPASS", None)
+    cfg.pop("HEC_TOKEN", None)
+
+    # Store pointer only for HEC token
+    cfg["HEC_TOKEN_SECRET"] = {
+        "realm": "backfill_hec",
+        "username": "hec_token",
+        "app": "search",
+    }
+
+    save_config(cfg)
+    print("\n[DONE] HEC token stored in storage/passwords and config.json updated.")
+
+def ensure_secrets_in_config():
+    required_keys = ["HEC_TOKEN_SECRET", "SPLUNK_USER"]
+    missing = [k for k in required_keys if k not in config]
+    if missing:
+        secure_my_creds(config)
+        new_cfg = load_config()
+        config.clear()
+        config.update(new_cfg)
+
+def get_secret(secret_cfg):
+    splunk_server = config.get("SPLUNK_SERVER")
+    realm = secret_cfg["realm"]
+    username = secret_cfg["username"]
+    app = secret_cfg.get("app", "search")
+    user, pw = get_splunk_auth()
+    # Use app context to match where the credential is stored
+    url = f"{splunk_server}/servicesNS/nobody/{app}/storage/passwords"
+    params = {"output_mode": "json"}
+    r = requests.get(url, auth=(user, pw), params=params, verify=False)
+    r.raise_for_status()
+    data = r.json()
+
+    for entry in data.get("entry", []):
+        content = entry.get("content", {})
+        if content.get("realm") == realm and content.get("username") == username:
+            return content.get("clear_password") or content.get("password")
+
+    raise RuntimeError(f"Secret {realm}:{username} not found in storage/passwords")
+
+# ==============================================================
+# Define Configurations
+# ==============================================================
+CONFIG_PATH = Path(__file__).parent / "config.json"
+
+config = load_config()
+ensure_secrets_in_config()
+
+#pull from config file 
 SPLUNK_SERVER = config.get("SPLUNK_SERVER")
-SPLUNK_USER = config.get("SPLUNK_USER")
-SPLUNK_PASS = config.get("SPLUNK_PASS")
+SPLUNK_USER   = config.get("SPLUNK_USER")
 LOGGING_LEVEL = config.get("LOGGING_LEVEL")  # Can be "DEBUG", "WARNING", "ERROR", etc.
 DEBUG_LEVEL = int(config.get("DEBUG_LEVEL", 1)) #Default to DEBUG level 1 if not defined (Levels 1 & 2)
 BACKFILL_START = int(config.get("BACKFILL_START"))
 BACKFILL_END = int(config.get("BACKFILL_END"))
-SEARCH_WINDOW_SECONDS =  int(config.get("SEARCH_WINDOW_SECONDS"))
 CORRELATION_SEARCH_FILTER =  config.get("CORRELATION_SEARCH_FILTER")
+LOG_DIR = config.get("LOG_DIRECTORY", "logs")
+EVENTS_DIR = config.get("EVENTS_DIRECTORY", "events")
+TEST_DIR = config.get("TEST_DIRECTORY", "test")
 
-#FILE DEFAULT NAME CONFIGS
+#create folders if needed
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(EVENTS_DIR, exist_ok=True)
+os.makedirs(TEST_DIR, exist_ok=True)
+
+# ==============================================================
+#FILE NAME CONFIGS
+# ==============================================================
+def _events_dir_for_mode(mode: str) -> str:
+    """
+    Full runs write JSON/TXT under EVENTS_DIR, tests under TEST_DIR.
+    """
+    return EVENTS_DIR if mode == "full" else TEST_DIR
+def backfill_events_path(backfill_key: str, mode: str = "full") -> str:
+    base_dir = _events_dir_for_mode(mode)
+    return os.path.join(base_dir, f"backfill_events_{backfill_key}.json")
+
+def active_searches_path(backfill_key: str, mode: str = "full") -> str:
+    base_dir = _events_dir_for_mode(mode)
+    return os.path.join(base_dir, f"active_correlation_searches_{backfill_key}.json")
+
+def risk_events_json_path(backfill_key: str, mode: str = "full") -> str:
+    base_dir = _events_dir_for_mode(mode)
+    return os.path.join(base_dir, f"risk_events_{backfill_key}.json")
+
+def notable_events_txt_path(backfill_key: str, mode: str = "full") -> str:
+    base_dir = _events_dir_for_mode(mode)
+    return os.path.join(base_dir, f"notable_events_{backfill_key}.txt")
+
+def risk_events_txt_path(backfill_key: str, mode: str = "full") -> str:
+    base_dir = _events_dir_for_mode(mode)
+    return os.path.join(base_dir, f"risk_events_{backfill_key}.txt")
+
+def window_log_path(backfill_key: str, mode: str = "full") -> str:
+    base_dir = LOG_DIR
+    return os.path.join(base_dir, f"backfill_window_log_{backfill_key}.csv")
+
+#define global for fallback behavior
 global POINTER_FILE,BACKFILL_EVENTS_FILE,ACTIVE_SEARCHES_FILE,RISK_EVENTS_FILE,NOTABLE_EVENTS_TXT,RISK_EVENTS_TXT
-POINTER_FILE = "backfill_pointer.json"
+
+POINTER_FILE = os.path.join(LOG_DIR,"backfill_pointer.json")
 BACKFILL_EVENTS_FILE = None
 ACTIVE_SEARCHES_FILE = None
 RISK_EVENTS_FILE = None
 NOTABLE_EVENTS_TXT = None
 RISK_EVENTS_TXT = None
 BACKFILL_WINDOW_LOG = None
+
 # File Names for Testing
-TEST_POINTER_FILE = "test_backfill_pointer.json"
+TEST_POINTER_FILE = os.path.join(LOG_DIR,"test_backfill_pointer.json")
 TEST_SUFFIX = "test"
 
 def get_test_backfill_key():
     return f"{TEST_SUFFIX}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+
 ################################################################
-
-
 # ===============================
 # Logging Setup
 # ===============================
@@ -54,7 +209,7 @@ logging.basicConfig(
     level=numeric_level,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler("splunk_backfill.log"),
+        logging.FileHandler(os.path.join(LOG_DIR, "splunk_backfill.log")),
         logging.StreamHandler()
     ]
 )
@@ -73,13 +228,33 @@ def debug(msg, level=1):
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 logging.info(f"Logging initialized at level: {LOGGING_LEVEL}")
 
+################################################################
 # ===============================
 # Helper Utilities
 # ===============================
 
-# Optional filter config
+# # # # ===============================
+# # # # Search Filter Configs
+# # # # ===============================
+BACKFILL_FILTER_CONFIG = "backfill_search_filters.json"
+BACKFILL_SEARCH_NAME_ALLOWLIST = set()
+
+if os.path.exists(BACKFILL_FILTER_CONFIG):
+    try:
+        with open(BACKFILL_FILTER_CONFIG) as f:
+            backfill_cfg = json.load(f)
+        BACKFILL_SEARCH_NAME_ALLOWLIST = set(
+            backfill_cfg.get("search_name_allowlist", [])
+        )
+        logging.info(
+            f"Loaded {len(BACKFILL_SEARCH_NAME_ALLOWLIST)} search names from {BACKFILL_FILTER_CONFIG}"
+        )
+    except Exception as e:
+        logging.error(f"Failed to load {BACKFILL_FILTER_CONFIG}: {e}")
+
 TEST_FILTER_CONFIG = "backfill_test_filters.json"
 TEST_SEARCH_NAME_ALLOWLIST = set()
+
 
 if os.path.exists(TEST_FILTER_CONFIG):
     try:
@@ -89,13 +264,18 @@ if os.path.exists(TEST_FILTER_CONFIG):
         logging.info(f"Loaded {len(TEST_SEARCH_NAME_ALLOWLIST)} test search names from {TEST_FILTER_CONFIG}")
     except Exception as e:
         logging.error(f"Failed to load {TEST_FILTER_CONFIG}: {e}")
-##
 
+# # # # ===============================
+# # # # Splunk Requests Function
+# # # # ===============================
 def splunk_request(method, endpoint, params=None, data=None, headers=None):
     """Perform REST API calls to Splunk with detailed diagnostics."""
     url = f"{SPLUNK_SERVER}{endpoint}"
-    auth = (SPLUNK_USER, SPLUNK_PASS)
-    default_headers = {'Content-Type': 'application/json'}
+    user, pw = get_splunk_auth()
+    default_headers = {
+        "Content-Type": "application/json"
+    }
+
     if headers:
         default_headers.update(headers)
 
@@ -103,8 +283,9 @@ def splunk_request(method, endpoint, params=None, data=None, headers=None):
         debug(f"Sending {method.upper()} {url} with params={params}, data={data}", level=1)
         response = requests.request(
             method, url,
+            auth=(user, pw),
             params=params, data=data,
-            auth=auth, headers=default_headers,
+            headers=default_headers,
             verify=False, stream=True, timeout=60
         )
         debug(f"Response status: {response.status_code}", level=1)
@@ -114,7 +295,10 @@ def splunk_request(method, endpoint, params=None, data=None, headers=None):
     except Exception as e:
         logging.error(f"Request error for {url}: {e}")
         return None
-
+    
+# # # # ===============================
+# # # # Manage Time Functions
+# # # # ===============================
 def epoch_to_iso_utc(epoch):
     """Convert epoch seconds to ISO 8601 UTC string."""
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -152,29 +336,40 @@ def parse_relative_time_spec(spec):
 
     return fn
 
+# # # # ===============================
+# # # # Initialize the Search Result Log File
+# # # # ===============================
 def init_window_log(path):
     if not os.path.exists(path):
         with open(path, "w") as f:
             f.write("search_name,window_start,window_end,results_returned,per_search_window_seconds\n")
 
-def compute_window_seconds_from_dispatch(disp_earliest, disp_latest, fallback_window):
+# # # # ===============================
+# # # # Determine Search windows
+# # # # ===============================
+def compute_window_seconds_from_dispatch(disp_earliest, disp_latest):
     """
     Compute window size (in seconds) from dispatch.earliest_time and dispatch.latest_time.
     Both are expected to be relative time strings (no absolute, no infinity).
-    If parsing fails, returns fallback_window (existing SEARCH_WINDOW_SECONDS).
+    If parsing fails, returns default 30m window.
     """
+
+    DEFAULT_WINDOW_SECONDS = 1800
+
     if not disp_earliest or not disp_latest:
-        return fallback_window
+        logging.warning(f"Missing dispatch times '{disp_earliest}'/'{disp_latest}', "
+                        f"using default 30m window")
+        return DEFAULT_WINDOW_SECONDS
 
     try:
         earliest_fn = parse_relative_time_spec(disp_earliest)
         latest_fn = parse_relative_time_spec(disp_latest)
     except Exception as e:
         logging.warning(f"Unable to parse dispatch times '{disp_earliest}'/'{disp_latest}', "
-                        f"using fallback window: {e}")
-        return fallback_window
+                        f"using default 30m window")
+        return DEFAULT_WINDOW_SECONDS
 
-    # Use current time as reference. Only the difference matters. [web:32][web:37]
+    # Use current time as reference. Only the difference matters.
     now_epoch = int(time.time())
     e_epoch = earliest_fn(now_epoch)
     l_epoch = latest_fn(now_epoch)
@@ -182,39 +377,15 @@ def compute_window_seconds_from_dispatch(disp_earliest, disp_latest, fallback_wi
     window_seconds = int(l_epoch - e_epoch)
     if window_seconds <= 0:
         logging.warning(f"Computed non-positive window ({window_seconds}) from "
-                        f"'{disp_earliest}'/'{disp_latest}', using fallback window.")
-        return fallback_window
+                        f"'{disp_earliest}'/'{disp_latest}', using default 30m window.")
+        return DEFAULT_WINDOW_SECONDS
     logging.debug(f"Derived window_seconds={window_seconds} from "
                   f"earliest='{disp_earliest}', latest='{disp_latest}'")
     return window_seconds
 
-def get_test_active_searches():
-    """
-    Return active searches filtered by TEST_SEARCH_NAME_ALLOWLIST.
-    If the allowlist is empty, fall back to all active searches.
-    """
-    all_searches = get_active_correlation_searches(active_search_filter=CORRELATION_SEARCH_FILTER)
-    if not TEST_SEARCH_NAME_ALLOWLIST:
-        logging.info("No TEST_SEARCH_NAME_ALLOWLIST configured; using all active searches for test.")
-        return all_searches
-
-    filtered = []
-    for s in all_searches:
-        content = s.get("content", {})
-        search_name = s.get("name")
-        rule_title = content.get("action.notable.param.rule_title") or content.get("action.correlationsearch.label")
-        if search_name in TEST_SEARCH_NAME_ALLOWLIST or rule_title in TEST_SEARCH_NAME_ALLOWLIST:
-            filtered.append(s)
-
-    logging.info(f"Using {len(filtered)} searches for test run based on TEST_SEARCH_NAME_ALLOWLIST.")
-    # Overwrite the active file with just the filtered set for test
-    with open(ACTIVE_SEARCHES_FILE, "w") as f:
-        json.dump(filtered, f, indent=2)
-    return filtered
-
-# ===============================
-# HEC Ingest Utility
-# ===============================
+# # # # ===============================
+# # # # HEC Ingest Utility
+# # # # ===============================
 def ingest_kv_txt_to_hec(file_path, hec_url, hec_token, index, sourcetype=None, source=None, verify_ssl=False, status_interval=25):
     """
     Reads a text file where each line is a comma-separated key="value" string.
@@ -255,8 +426,9 @@ def ingest_kv_txt_to_hec(file_path, hec_url, hec_token, index, sourcetype=None, 
 
     logging.info(f"KV ingest for {file_path} complete. Total events ingested: {count}.")
 
+################################################################
 # ===============================
-# Step 1: Get Active Correlation Searches
+# Get Active Correlation Searches
 # ===============================
 def get_active_correlation_searches(active_search_filter):
     filters = {
@@ -280,11 +452,15 @@ def get_active_correlation_searches(active_search_filter):
     active_searches = []
     for entry in results:
         content = entry.get("content", {})
-        if not content.get("action.correlationsearch.label", "").startswith("Yuri"):
-            continue
         if content.get("disabled") == 1:
             continue
         
+        search_name = entry.get("name")
+        rule_title = (
+            content.get("action.notable.param.rule_title")
+            or content.get("action.correlationsearch.label")
+        )
+
         filtered_data = {k: v for k, v in content.items() if k in [
             "action.correlationsearch.enabled",
             "action.correlationsearch.label",
@@ -325,11 +501,9 @@ def get_active_correlation_searches(active_search_filter):
     logging.info(f"Saved {len(active_searches)} active searches to file.")
     return active_searches
 
-
 # ===============================
-# Step 2: Run Backfill
+# Run Backfill Searches
 # ===============================
-
 def append_to_backfill_file(new_events, events_file):
     """Append search results to BACKFILL_EVENTS_FILE as a growing JSON array."""
     
@@ -356,7 +530,7 @@ def append_to_backfill_file(new_events, events_file):
     except Exception as e:
         logging.error(f"Error appending to {events_file}: {e}")
 
-def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_file=None, risk_file=None, backfill_end=None , per_search_window_limit=None):
+def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_file=None, risk_file=None, backfill_end=None, per_search_window_limit=None):
     if backfill_key is None:
         backfill_key = BACKFILL_KEY
     if pointer_file is None:
@@ -370,18 +544,50 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
     if per_search_window_limit is None:
         per_search_window_limit = float("inf")  # no limit by default
     
-    pointer = load_pointer(pointer_file)
-    last_index = pointer.get("last_search_index", 0)
-    last_window = pointer.get("last_window_start", BACKFILL_START)
+    pointer_data = load_pointer(pointer_file)
+    runs = pointer_data.get("runs", [])
+    run_record = next((r for r in runs if r.get("backfill_key") == backfill_key), None)
 
+    if run_record:
+        last_index = run_record.get("last_search_index", 0)
+        last_window = run_record.get("last_window_start", BACKFILL_START)
+    else:
+        last_index = 0
+        last_window = BACKFILL_START
+    
     try:
         with open(active_file) as f:
             searches = json.load(f)
+
     except FileNotFoundError:
         logging.error("No active_correlation_searches.json found.")
         return
 
     for idx, s in enumerate(searches[last_index:], start=last_index):
+        content = s.get("content", {})
+        search_name = s.get("name")
+        rule_title =  content.get("action.correlationsearch.label")
+
+        # Determine mode based on which pointer file you're using
+        is_test_run = (pointer_file == TEST_POINTER_FILE)
+
+        if is_test_run:
+            # Apply TEST_SEARCH_NAME_ALLOWLIST only for test runs
+            if TEST_SEARCH_NAME_ALLOWLIST:
+                if (
+                    search_name not in TEST_SEARCH_NAME_ALLOWLIST
+                    and rule_title not in TEST_SEARCH_NAME_ALLOWLIST
+                ):
+                    continue
+        else:
+            # Apply BACKFILL_SEARCH_NAME_ALLOWLIST only for full runs
+            if BACKFILL_SEARCH_NAME_ALLOWLIST:
+                if (
+                    search_name not in BACKFILL_SEARCH_NAME_ALLOWLIST
+                    and rule_title not in BACKFILL_SEARCH_NAME_ALLOWLIST
+                ):
+                    continue
+                
         # always start at 0 per search
         local_breaker = 0
         
@@ -395,9 +601,7 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
         disp_earliest = content.get("dispatch.earliest_time")
         disp_latest = content.get("dispatch.latest_time")
 
-        per_search_window = compute_window_seconds_from_dispatch(
-            disp_earliest, disp_latest, SEARCH_WINDOW_SECONDS
-        )
+        per_search_window = compute_window_seconds_from_dispatch(disp_earliest, disp_latest)
 
         logging.info(
             f"Using window of {per_search_window} seconds for search '{current_search_name}' "
@@ -419,7 +623,7 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
 
         while start_time < end_time and local_breaker < per_search_window_limit:
             window_start = start_time
-            window_end = min(start_time + per_search_window, end_time)
+            window_end = start_time + per_search_window
 
             if local_breaker == 0:
                 debug("Starting backfill of events", level=1)
@@ -443,10 +647,11 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                 logging.info(f"Submitting backfill for search: {current_search_name} "
                     f"({datetime.utcfromtimestamp(start_time)} to {datetime.utcfromtimestamp(window_end)})")
                 debug(f"POST Request:\nURL: {url}\nHeaders: {headers}\nPayload: {encoded_data}", level=1)
+                user, pw = get_splunk_auth()
                 response = requests.post(
                     url,
-                    auth=(SPLUNK_USER, SPLUNK_PASS),
                     data=encoded_data.encode("utf-8"),
+                    auth=(user, pw),
                     headers=headers,
                     verify=False
                 )
@@ -469,7 +674,8 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                 # Poll job status until DONE
                 job_url = f"{SPLUNK_SERVER}/servicesNS/nobody/{namespace}/search/jobs/{sid}"
                 while True:
-                    status_r = requests.get(job_url, auth=(SPLUNK_USER, SPLUNK_PASS),
+                    user, pw = get_splunk_auth()
+                    status_r = requests.get(job_url,auth=(user, pw),
                                             params={"output_mode": "json"}, verify=False)
                     job_data = status_r.json()
                     dispatch_state = job_data.get("entry", [{}])[0].get("content", {}).get("dispatchState")
@@ -486,9 +692,10 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
 
                 while True:
                     params = {"output_mode": "json", "count": page_size, "offset": offset}
+                    user, pw = get_splunk_auth()
                     results_r = requests.get(
                         result_url,
-                        auth=(SPLUNK_USER, SPLUNK_PASS),
+                        auth=(user, pw),
                         params=params,
                         verify=False
                     )
@@ -506,7 +713,32 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                 window_size = per_search_window  # explicit for clarity
                 
                 for r in result_data:
-                    r["orig_time"] = r.pop("_time", "")
+                    # Normalize keys to strings to avoid bytes/str issues
+                    normalized = {}
+                    for k, v in list(r.items()):
+                        sk = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+                        # If key changed, move it
+                        if sk != k:
+                            normalized[sk] = v
+                            del r[k]
+                        else:
+                            normalized[sk] = v
+                    r.update(normalized)
+
+
+                    # Map original Splunk fields to orig_* variants, if present
+                    orig_map = {
+                        "host": "orig_host",
+                        "index": "orig_index",
+                        "source": "orig_source",
+                        "sourcetype": "orig_sourcetype",
+                        "_time": "orig_time"
+                    }
+
+                    for src, dest in orig_map.items():
+                        if src in r and dest not in r:
+                            r[dest] = r[src]
+
                     r["info_min_time"] = window_start
                     r["info_max_time"] = window_end
                     r["info_search_time"] = timestamp_now
@@ -521,7 +753,8 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                     r["risk_message"] = content.get("action.risk.param._risk_message", "")
                     r["risk_a"] = content.get("action.risk", "")
                     r["backfill_identifier"] = backfill_key
-                    for field in ["_bkt", "_kv", "_raw", "_serial", "_si", "_sourcetype", "_subsecond", "linecount", "splunk_server"]:
+
+                    for field in ["_bkt","_cd","_indextime","_time", "_kv", "_raw", "_serial", "_si", "_sourcetype", "_subsecond", "linecount", "splunk_server","host", "index","source","sourcetype"]:
                         r.pop(field, None)
 
                 # Append all results to global backfill file
@@ -533,22 +766,29 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                     human_start = epoch_to_iso_utc(window_start)
                     human_end = epoch_to_iso_utc(window_end)
                     results_count = len(result_data)
-                    with open(BACKFILL_WINDOW_LOG, "a") as f:
-                        f.write(
-                            f'"{current_search_name}",'
-                            f"{human_start},"
-                            f"{human_end},"
-                            f"{results_count},"
-                            f"{window_size}\n"
-                        )
+                    
+                    if BACKFILL_WINDOW_LOG:
+                        human_start = datetime.utcfromtimestamp(window_start).isoformat()
+                        human_end   = datetime.utcfromtimestamp(window_end).isoformat()
+                        with open(BACKFILL_WINDOW_LOG, "a") as f:
+                            f.write(
+                                f'"{current_search_name}",'
+                                f"{human_start},{human_end},{results_count},{per_search_window}\n"
+                            )
                 except Exception as e:
                     logging.warning(f"Failed to write window log entry: {e}")
 
 
                 # Update pointer after successful window
-                pointer["last_search_index"] = idx
-                pointer["last_window_start"] = window_end
-                save_pointer(pointer, pointer_file)
+                upsert_run_record(
+                    backfill_key=backfill_key,
+                    mode="full" if pointer_file == POINTER_FILE else "test",
+                    backfill_start=BACKFILL_START,
+                    backfill_end=backfill_end or BACKFILL_END,
+                    last_search_index=idx,
+                    last_window_start=start_time,
+                    pointer_file=pointer_file
+                )
                 logging.info(f"Pointer updated after successful window [{window_start}-{window_end}].")
 
             except Exception as e:
@@ -560,9 +800,8 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
 
     logging.info(f"Backfill completed. All results stored in {events_file}.")
 
-
 # ===============================
-# Step 3: Generate Notable Events File
+# Generate Notable Events TXT File 
 # ===============================
 def generate_notable_events(textfile=None, events_file=None):
     if textfile is None:
@@ -586,19 +825,45 @@ def generate_notable_events(textfile=None, events_file=None):
         return
     
     with open(textfile, "w") as out:
+        # Fields you do NOT want in the TXT output
+        exclude_fields = {
+            "_time",
+            "_bkt",
+            "_kv",
+            "_raw",
+            "_serial",
+            "_si",
+            "_sourcetype",
+            "_subsecond",
+            "linecount",
+            "splunk_server",
+            "info_window_size",
+            "risk_a",
+        }
+
         for e in data:
-            parts = [str(e.get("_time", int(time.time())))]
-            parts += [f'{k}="{v}"' for k, v in e.items() if k != "_time"]
+            # First column: epoch time (prefer _time, fall back to orig_time, then now)
+            ts = e.get("_time", e.get("orig_time", int(time.time())))
+            parts = [str(ts)]
+
+            kv_pairs = []
+            for k, v in e.items():
+                if k in exclude_fields:
+                    continue
+                kv_pairs.append(f'{k}="{v}"')
+
+            parts += kv_pairs
             line = ", ".join(parts).replace("\\", "")
             out.write(line + "\n")
-        if not events_file:
-            logging.info(f"{events_file} contained 0 events; no notable_events file will be generated.")
-            return
-               
+
+    if not events_file:
+        logging.info(f"{events_file} contained 0 events; no notable_events file will be generated.")
+        return
+    
     logging.info(f"Generated {textfile} successfully.")
 
 # ===============================
-# Step 4: Generate Risk Events
+# Generate Risk Events (JSON & TXT Files)
 # ===============================
 def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfill_key=None):
     #Creates risk events from backfill_events.json by expanding each risk_val object into multiple individual risk events based on the fields inside it.
@@ -726,36 +991,37 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
     logging.info(f"Generated {textfile} successfully.")
 
 # ===============================
-# Pointer/Backfill Utilities
+# Pointer and File Management Utilities
 # ===============================
-def get_backfill_key_from_pointer():
-    global BACKFILL_EVENTS_FILE, ACTIVE_SEARCHES_FILE, RISK_EVENTS_FILE, NOTABLE_EVENTS_TXT, RISK_EVENTS_TXT, BACKFILL_WINDOW_LOG
-    """
-    Manage backfill_key selection:
-      - If pointer file has a key, let user reuse it or generate a new one.
-      - If no key exists, let user enter one or auto-generate.
-      - Update filenames and return the chosen key.
-    """
 
+def get_backfill_key_from_pointer() -> str:
+    global BACKFILL_EVENTS_FILE, ACTIVE_SEARCHES_FILE, RISK_EVENTS_FILE
+    global NOTABLE_EVENTS_TXT, RISK_EVENTS_TXT, BACKFILL_WINDOW_LOG
+
+    mode = "full"
     backfill_key = None
 
-    # Case 1: pointer file exists and has a backfill_key
+    # Load pointer and get current active key if present
     if os.path.exists(POINTER_FILE):
         try:
-            with open(POINTER_FILE, 'r') as f:
-                pointer_data = json.load(f)
-            existing_key = pointer_data.get("backfill_key")
+            pointer_data = load_pointer(POINTER_FILE)
+            existing_key = pointer_data.get("active_backfill_key")
         except Exception as e:
             logging.error(f"Error reading pointer file for backfill_key: {e}")
             existing_key = None
 
         if existing_key:
             print(f"\nExisting backfill identifier found in pointer file: {existing_key}")
-            choice = input("Use this backfill identifier? (y = yes, n = generate new, e = enter new): ").strip().lower()
-
+            choice = input(
+                "Use this backfill identifier? (y = yes, n = generate new, e = enter new): "
+            ).strip().lower()
             if choice == "y":
                 backfill_key = existing_key
                 logging.info(f"Using existing backfill_key from pointer: {backfill_key}")
+            elif choice == "n":
+                logging.info("Generating new backfill_key as requested.")
+                backfill_key = datetime.utcnow().strftime("backfill_%Y%m%dT%H%M%S")
+                logging.info(f"Auto-generated backfill_key for this sequence of event generation: {backfill_key}")
             elif choice == "e":
                 user_key = input("Enter new backfill identifier: ").strip()
                 if user_key:
@@ -763,40 +1029,53 @@ def get_backfill_key_from_pointer():
                     logging.info(f"Using user-entered backfill_key: {backfill_key}")
                 else:
                     logging.info("Empty input; auto-generating backfill_key instead.")
-            # if choice == 'n' or anything else, fall through to auto-generate
+            else:
+                logging.info("Generating new backfill_key.")
         else:
             logging.info("No backfill_key present in pointer file.")
 
-    # Case 2: no valid key chosen yet – enter or auto-generate
+    # If still no key, prompt or auto-generate
     if not backfill_key:
-        user_input = input("No active backfill identifier. Enter one now, or press Enter to auto-generate: ").strip()
+        user_input = input(
+            "No active backfill identifier. Enter one now, or press Enter to auto-generate: "
+        ).strip()
         if user_input:
             backfill_key = user_input
             logging.info(f"Using user-entered backfill_key: {backfill_key}")
         else:
             backfill_key = datetime.utcnow().strftime("backfill_%Y%m%dT%H%M%S")
-            logging.info(f"Auto-generated backfill_key for this sequence of event generation: {backfill_key}")
+            logging.info(
+                f"Auto-generated backfill_key for this sequence of event generation: {backfill_key}"
+            )
 
-    # After choosing backfill_key (existing, user-entered, or auto-generated):
-    BACKFILL_EVENTS_FILE = f"backfill_events_{backfill_key}.json"
-    ACTIVE_SEARCHES_FILE = f"active_correlation_searches_{backfill_key}.json"
-    RISK_EVENTS_FILE = f"risk_events_{backfill_key}.json"
-    NOTABLE_EVENTS_TXT = f"notable_events_{backfill_key}.txt"
-    RISK_EVENTS_TXT = f"risk_events_{backfill_key}.txt"
-    BACKFILL_WINDOW_LOG = f"backfill_window_log_{backfill_key}.csv"
+        # Update pointer with new record with index of 0
+        upsert_run_record(
+            backfill_key=backfill_key,
+            mode=mode,
+            backfill_start=BACKFILL_START,
+            backfill_end=BACKFILL_END,
+            last_search_index=0,
+            last_window_start=BACKFILL_START,
+            pointer_file=POINTER_FILE,
+        )
+    else:
+        # Existing key: just mark it active, do NOT reset
+        pointer_data = load_pointer(POINTER_FILE)
+        pointer_data["active_backfill_key"] = backfill_key
+        save_pointer(pointer_data, pointer_file=POINTER_FILE)
 
-    # Ensure pointer file carries the new key
-    pointer_data = load_pointer()
-    pointer_data["backfill_key"] = backfill_key
-    save_pointer(pointer_data)
+    # Set global file paths for this run (full mode)
+    BACKFILL_EVENTS_FILE = backfill_events_path(backfill_key, mode=mode)
+    ACTIVE_SEARCHES_FILE = active_searches_path(backfill_key, mode=mode)
+    RISK_EVENTS_FILE = risk_events_json_path(backfill_key, mode=mode)
+    NOTABLE_EVENTS_TXT = notable_events_txt_path(backfill_key, mode=mode)
+    RISK_EVENTS_TXT = risk_events_txt_path(backfill_key, mode=mode)
+    BACKFILL_WINDOW_LOG = window_log_path(backfill_key, mode=mode)
 
     return backfill_key
 
 def save_pointer(pointer_data, pointer_file=POINTER_FILE):
     try:
-        if "backfill_key" not in pointer_data:
-            if 'BACKFILL_KEY' in globals():
-                pointer_data["backfill_key"] = BACKFILL_KEY
         with open(pointer_file, "w") as f:
             json.dump(pointer_data, f, indent=2)
         debug("Updated pointer file.", level=1)
@@ -804,10 +1083,23 @@ def save_pointer(pointer_data, pointer_file=POINTER_FILE):
         logging.error(f"Failed to update pointer file: {e}")
 
 def load_pointer(pointer_file=POINTER_FILE):
+    """
+    Load pointer file as {"runs": [...], "active_backfill_key": "..."}.
+    Backward-compatible with old flat dicts.
+    """
     if not os.path.exists(pointer_file):
-        return {}
+        return {"runs": [], "active_backfill_key": None}
+
     with open(pointer_file) as f:
-        return json.load(f)
+        data = json.load(f)
+
+    if "runs" not in data:
+        # backward compatibility: old format → wrap into runs
+        data = {
+            "runs": [data],
+            "active_backfill_key": data.get("backfill_key"),
+        }
+    return data
 
 def assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=None, field_name="backfill_identifier"):
     """
@@ -847,14 +1139,52 @@ def assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=N
     else:
         logging.info(f"Detected backfill_key '{backfill_key}' in event files.")
 
+def upsert_run_record(backfill_key, mode, backfill_start, backfill_end,
+                      last_search_index=0, last_window_start=None,
+                      pointer_file=POINTER_FILE):
+    pointer_data = load_pointer(pointer_file)
+    runs = pointer_data.get("runs", [])
+
+    # default last_window_start to backfill_start
+    if last_window_start is None:
+        last_window_start = backfill_start
+
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # look for existing run
+    for run in runs:
+        if run.get("backfill_key") == backfill_key:
+            run.update({
+                "mode": mode,
+                "backfill_start": backfill_start,
+                "backfill_end": backfill_end,
+                "last_search_index": last_search_index,
+                "last_window_start": last_window_start,
+                "updated_at": now_iso,
+            })
+            break
+    else:
+        runs.append({
+            "backfill_key": backfill_key,
+            "created_at": now_iso,
+            "mode": mode,
+            "backfill_start": backfill_start,
+            "backfill_end": backfill_end,
+            "last_search_index": last_search_index,
+            "last_window_start": last_window_start,
+        })
+
+    pointer_data["runs"] = runs
+    pointer_data["active_backfill_key"] = backfill_key
+    save_pointer(pointer_data, pointer_file=pointer_file)
 
 # ===============================
-# Step 5 - Upload Notable events, and change their status to specified value
+# Upload Notable events, and change their status to specified value
 # ===============================
 def ingest_notables(file_path,backfill_key):
     assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=file_path)
     hec_url = config.get("HEC_URL")
-    hec_token = config.get("HEC_TOKEN")
+    hec_token = get_hec_token()
     ingest_kv_txt_to_hec(
         file_path=file_path,
         hec_url=hec_url,
@@ -863,34 +1193,9 @@ def ingest_notables(file_path,backfill_key):
         sourcetype="stash",
         source="backfill_notables"
     )
-    
-    
-    """
-    Ingest a file of notable events into Splunk using the oneshot API.
-    url = f"{SPLUNK_SERVER}/services/data/oneshot"
-    payload = {
-        'index': "notable",
-        'source': "backfill_notables",
-        'sourcetype': "stash"
-    }
-    files = {'file': open(file_path, 'rb')}
-    logging.info(f"Ingesting notables from {file_path} into index 'notable' via oneshot API.")
-    response = requests.post(
-        url,
-        auth=(SPLUNK_USER, SPLUNK_PASS),
-        data=payload,
-        files=files,
-        verify=False
-    )
-    files['file'].close()
-    logging.info(f"Notable ingest response: {response.status_code} - {response.text}")
-    return response
-
-    """
-
 
 # ===============================
-# Step 6 - Upload Risk events, and change their status to specified value
+# Upload Risk events
 # ===============================
 def ingest_risk(file_path,backfill_key):
     assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=file_path)
@@ -900,7 +1205,7 @@ def ingest_risk(file_path,backfill_key):
     1761141182, key1="value1", key2="value2", ...
     """
     hec_url = config.get("HEC_URL")
-    hec_token = config.get("HEC_TOKEN")
+    hec_token = get_secret(config["HEC_TOKEN_SECRET"])
     index = "risk"
     source = "backfill_risk"
     sourcetype = "stash"
@@ -950,7 +1255,7 @@ def ingest_risk(file_path,backfill_key):
     logging.info(f"Risk event ingest to HEC complete for {file_path}.")
 
 # ===============================
-# Step 7 - Update Backfill Notable Statuses
+# Update Backfill Notable Statuses to defined 
 # ===============================
 def update_notable_status(backfill_key):
     """
@@ -977,11 +1282,12 @@ def update_notable_status(backfill_key):
 
     url = f"{SPLUNK_SERVER}/servicesNS/nobody/{namespace}/search/jobs"
     encoded_data = requests.models.RequestEncodingMixin._encode_params(search_payload)
+    user, pw = get_splunk_auth()
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     response = requests.post(
         url,
-        auth=(SPLUNK_USER, SPLUNK_PASS),
         data=encoded_data.encode("utf-8"),
+        auth=(user, pw),
         headers=headers,
         verify=False
     )
@@ -997,8 +1303,8 @@ def update_notable_status(backfill_key):
     # Poll job until DONE
     job_url = f"{SPLUNK_SERVER}/servicesNS/nobody/{namespace}/search/jobs/{sid}"
     while True:
-        status_r = requests.get(job_url, auth=(SPLUNK_USER, SPLUNK_PASS),
-                                params={"output_mode": "json"}, verify=False)
+        user, pw = get_splunk_auth()
+        status_r = requests.get(job_url, auth=(user, pw),params={"output_mode": "json"}, verify=False)
         dispatch_state = status_r.json().get("entry", [{}])[0].get("content", {}).get("dispatchState")
         if dispatch_state == "DONE":
             break
@@ -1012,7 +1318,7 @@ def update_notable_status(backfill_key):
 
     while True:
         params = {"output_mode": "json", "count": page_size, "offset": offset}
-        results_r = requests.get(results_url, auth=(SPLUNK_USER, SPLUNK_PASS), params=params, verify=False)
+        results_r = requests.get(results_url, auth=(user, pw), params=params, verify=False)
         page = results_r.json().get("results", [])
         ids_page = [row.get("event_id") for row in page if "event_id" in row]
         event_ids.extend(ids_page)
@@ -1030,12 +1336,12 @@ def update_notable_status(backfill_key):
         params = [("ruleUIDs", uid) for uid in batch_ids]
         params.append(("status", status_code))
         params.append(("comment", comment))
-
+        user, pw = get_splunk_auth()
         update_r = requests.post(
             update_url,
             data=params,
             verify=False,
-            auth=(SPLUNK_USER, SPLUNK_PASS)
+            auth=(user, pw)
         )
 
         if update_r.status_code == 200:
@@ -1046,39 +1352,106 @@ def update_notable_status(backfill_key):
     if not event_ids:
         logging.warning("No notable events found to update.")
 
+# ===============================
+# Test Run Function
+# ===============================
+def test_run():
+    global BACKFILL_EVENTS_FILE, ACTIVE_SEARCHES_FILE, RISK_EVENTS_FILE
+    global NOTABLE_EVENTS_TXT, RISK_EVENTS_TXT, BACKFILL_WINDOW_LOG, BACKFILL_KEY
+
+    mode = "test"
+    test_key = get_test_backfill_key()
+    BACKFILL_KEY = test_key  # so other functions can reference same key
+
+    # Compute all test file paths via helpers
+    test_events_file   = backfill_events_path(test_key, mode=mode)
+    test_active_file   = active_searches_path(test_key, mode=mode)
+    test_risk_file     = risk_events_json_path(test_key, mode=mode)
+    test_notable_file  = notable_events_txt_path(test_key, mode=mode)
+    test_risk_txt      = risk_events_txt_path(test_key, mode=mode)
+    test_window_log    = window_log_path(test_key, mode=mode)
+
+    # Persist these as globals only for the duration of test run (optional)
+    BACKFILL_EVENTS_FILE = test_events_file
+    ACTIVE_SEARCHES_FILE = test_active_file
+    RISK_EVENTS_FILE     = test_risk_file
+    NOTABLE_EVENTS_TXT   = test_notable_file
+    RISK_EVENTS_TXT      = test_risk_txt
+    BACKFILL_WINDOW_LOG  = test_window_log
+
+    # Decide which searches to use for test
+    all_searches = get_active_correlation_searches(active_search_filter=CORRELATION_SEARCH_FILTER)    
+
+    with open(test_active_file, "w") as f:
+        json.dump(all_searches, f, indent=2)
+
+    pointer_data = {
+        "last_search_index": 0,
+        "last_window_start": BACKFILL_START,
+        "backfill_key": test_key,
+    }
+    with open(TEST_POINTER_FILE, "w") as f:
+        json.dump(pointer_data, f, indent=2)
+
+    init_window_log(test_window_log)
+
+    run_backfill(
+        backfill_key=test_key,
+        pointer_file=TEST_POINTER_FILE,
+        events_file=test_events_file,
+        active_file=test_active_file,
+        risk_file=test_risk_file,
+        per_search_window_limit=2,
+    )
+
+    generate_notable_events(textfile=test_notable_file, events_file=test_events_file)
+    generate_risk_events(
+        textfile=test_risk_txt,
+        events_file=test_events_file,
+        risk_file=test_risk_file,
+    )
 
 
 # ===============================
 # Menu System
 # ===============================
 def menu():
+     global BACKFILL_KEY
+     resume_logging="\n\n##############################################\n#######################\n# Resume Logging\n#######################"
+
      while True:
         print("\n\n##############################################\n#######################\n# Main Menu\n#######################")
-        print("\nWelcome to Splunk Correlation Search Backfill Script!")
-        print("This script currently outputs Notable Events with time the search ran (today), while Risk events are backdated to time of event\n")
-        print(f"Current backfill identifier: {BACKFILL_KEY}")
-        print("a) Run All (b-h)")
-        print("b) Get Active Searches")
-        print("c) Start Backfill")
-        print("d) Generate Notable Events")
-        print("e) Generate Risk Events")
-        print("f) Ingest Notable events")
-        print("g) Ingest Risk events")
-        print("h) Bulk Update Notable Event status")
+        print("#\n# Welcome to Splunk Correlation Search Backfill Script!")
+        print("# This script currently outputs Notable Events with time the search ran (today), while Risk events are backdated to time of event\n#")
+        print(f"# Current backfill identifier: {BACKFILL_KEY}")
+        print("# a) Run All (b-g)")
+        print("# b) Get Active Searches")
+        print("# c) Start Backfill")
+        print("# d) Generate Notable Events")
+        print("# e) Generate Risk Events")
+        print("# f) Ingest Notable events")
+        print("# g) Ingest Risk events")
 
-        print("\n#######################\n# Additional Options: \n#######################")
-        print("r) Restart Backfill from Pointer - you will need to run d, e, f, g, and h manually afterwards.")
-       
-        print("\n#######################\n# Testing Option: \n#######################")
-        print("t) Test Run - Get - (get all searches defined in filter OR only retrieve the first 3 searches backfill and use 2 search windows only)")
-        print("u) Test Run - Push - (push results from test run to Splunk, and update event status for these)")
+        print("#\n#######################\n# Update after verification of events in Analyst queue: \n#######################")
+        print("# h) Bulk Update Notable Event status")
 
-        print("\n#######################\n# EXIT \n#######################")
-        print("x) To Exit Script")
+        print("#\n#######################\n# Additional Options: \n#######################")
+        print("# i) Change Backfill Identifier")
+        print("# r) Restart Backfill from Pointer - you will need to run d, e, f, g, and h manually afterwards.")
+               
+        print("#\n#######################\n# Testing Option: \n#######################")
+        print("# t) Test Run - Get - (get all searches defined in filter OR only retrieve the first 3 searches backfill and use 2 search windows only)")
+        print("# u) Test Run - Push - (push results from test run to Splunk, and update event status for these)")
+
+        print("#\n#######################\n# EXIT \n#######################")
+        print("# x) To Exit Script")
+        print("\n\n##############################################\n")
         choice = input("Select an option: ").lower()
 
         if choice == 'a':
+            print(resume_logging)
             get_active_correlation_searches(active_search_filter=CORRELATION_SEARCH_FILTER)
+            init_window_log(BACKFILL_WINDOW_LOG)
             run_backfill(backfill_key=BACKFILL_KEY)
             generate_notable_events(textfile=NOTABLE_EVENTS_TXT,events_file=BACKFILL_EVENTS_FILE)
             generate_risk_events(textfile=RISK_EVENTS_TXT,events_file=BACKFILL_EVENTS_FILE)
@@ -1089,95 +1462,85 @@ def menu():
             else:
                 ingest_notables(file_path=NOTABLE_EVENTS_TXT, backfill_key=BACKFILL_KEY)
                 ingest_risk(file_path=RISK_EVENTS_TXT, backfill_key=BACKFILL_KEY)
-                update_notable_status(backfill_key=BACKFILL_KEY)
+        
         elif choice == 'b':
+            print(resume_logging)
             get_active_correlation_searches(active_search_filter=CORRELATION_SEARCH_FILTER)
+       
         elif choice == 'c':
+            print(resume_logging)
+            init_window_log(BACKFILL_WINDOW_LOG)
             run_backfill(backfill_key=BACKFILL_KEY)
+       
         elif choice == 'r':
-            run_backfill(backfill_key=BACKFILL_KEY)
-        elif choice == 't':
-            # Test Run - Get: get only filtered searches and limit backfill
-            test_searches = get_test_active_searches()
-            if not test_searches:
-                logging.info("No searches matched test filter; nothing to backfill.")
+            print(resume_logging)
+            # Disallow resuming test runs with 'r'
+            if BACKFILL_KEY.startswith(TEST_SUFFIX + "_"):
+                print(f"Current backfill identifier '{BACKFILL_KEY}' is a test run.")
+                print("Use test options (t/u) or change the backfill identifier (option i) before resuming.")
+                logging.warning(f"Refused to resume backfill for test key '{BACKFILL_KEY}' via 'r'.")
             else:
-                #Test run
-                test_run()
-                logging.info("Test backfill run completed. Review JSON/TXT output before ingest.")
- 
+                run_backfill(backfill_key=BACKFILL_KEY)
+       
+        elif choice == 't':
+            print(resume_logging)
+            # Test Run - Get: get only filtered searches and limit backfill
+            test_run()
+            logging.info("Test backfill run completed. Review JSON/TXT output before ingest.")
+        
         elif choice == 'u':
+            print(resume_logging)
             # Load test pointer to get test key
             if os.path.exists(TEST_POINTER_FILE):
                 with open(TEST_POINTER_FILE, "r") as f:
                     pointer_data = json.load(f)
-                test_key = pointer_data.get("backfill_key")
-                test_notable_file = f"test_notable_events_{test_key}.txt"
-                test_risk_txt = f"test_risk_events_{test_key}.txt"
-                #BACKFILL_KEY = test_key  # Override global for this session
-                ingest_notables(file_path=test_notable_file,backfill_key=test_key)
-                ingest_risk(file_path=test_risk_txt,backfill_key=test_key)
+
+                # New format: use active_backfill_key, fallback to first run
+                test_key = pointer_data.get("active_backfill_key")
+                if not test_key:
+                    runs = pointer_data.get("runs", [])
+                    if runs:
+                        test_key = runs[0].get("backfill_key")
+
+                if not test_key:
+                    print("Test pointer file is missing a valid backfill_key. Please run 't' again.")
+                    return
+
+                test_notable_file = notable_events_txt_path(test_key, mode="test")
+                test_risk_txt = risk_events_txt_path(test_key, mode="test")
+
+                ingest_notables(file_path=test_notable_file, backfill_key=test_key)
+                ingest_risk(file_path=test_risk_txt, backfill_key=test_key)
                 update_notable_status(backfill_key=test_key)
             else:
                 print("No test run found. Please run 't' first.")
+
         elif choice == 'd':
+            print(resume_logging)
             generate_notable_events()
         elif choice == 'e':
+            print(resume_logging)
             generate_risk_events()
         elif choice == 'f':
+            print(resume_logging)
             ingest_notables(file_path=NOTABLE_EVENTS_TXT, backfill_key=BACKFILL_KEY)
         elif choice == 'g':
+            print(resume_logging)
             ingest_risk(file_path=RISK_EVENTS_TXT, backfill_key=BACKFILL_KEY)
         elif choice == 'h':
+            print(resume_logging)
             update_notable_status(backfill_key=BACKFILL_KEY)
+
+        elif choice == "i":
+            print("##############################################")
+            print("############ Change Backfill Identifier ############")
+            BACKFILL_KEY = get_backfill_key_from_pointer()
+
         elif choice == 'x':
             print("Exiting script.")
             break
         else:
             logging.info("Invalid option.")
-
-def test_run():
-    test_key = get_test_backfill_key()
-    test_pointer_file = TEST_POINTER_FILE
-    test_events_file = f"backfill_events_{test_key}.json"
-    test_active_file = f"active_correlation_searches_{test_key}.json"
-    test_risk_file   = f"risk_events_{test_key}.json"
-    test_notable_file = f"notable_events_{test_key}.txt"
-    test_risk_txt     = f"risk_events_{test_key}.txt"
-
-    # Decide which searches to use for test
-    if TEST_SEARCH_NAME_ALLOWLIST:
-        # Use filtered list
-        searches = get_test_active_searches()
-    else:
-        # No filter configured: use first 2 active searches
-        all_searches = get_active_correlation_searches(active_search_filter=CORRELATION_SEARCH_FILTER)
-        searches = all_searches[:2]
-        logging.info(f"No TEST_SEARCH_NAME_ALLOWLIST; using first {len(searches)} active searches for test.")
-
-    with open(test_active_file, "w") as f:
-        json.dump(searches, f, indent=2)
-
-
-    pointer_data = {"last_search_index": 0, "last_window_start": BACKFILL_START, "backfill_key": test_key}
-    with open(test_pointer_file, "w") as f:
-        json.dump(pointer_data, f, indent=2)
-
-    test_backfill_end = BACKFILL_START + (SEARCH_WINDOW_SECONDS * 2)
-
-    run_backfill(
-        backfill_key=test_key,
-        pointer_file=test_pointer_file,
-        events_file=test_events_file,
-        active_file=test_active_file,
-        risk_file=test_risk_file,
-        backfill_end=test_backfill_end,
-        per_search_window_limit=2
-    )
-
-    generate_notable_events(textfile=test_notable_file, events_file=test_events_file)
-    generate_risk_events(textfile=test_risk_txt, events_file=test_events_file, risk_file=test_risk_file)
-
 
 # ===============================
 # Main Execution
@@ -1186,7 +1549,6 @@ def main():
     global BACKFILL_KEY
     logging.info("Starting Splunk Backfill Script (v9.3.3)")
     BACKFILL_KEY = get_backfill_key_from_pointer()
-    init_window_log(BACKFILL_WINDOW_LOG)
     menu()
 
 if __name__ == "__main__":

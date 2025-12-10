@@ -1,0 +1,39 @@
+﻿Instructions for use:
+
+Splunk configs to do
+    a) Identify user that can access rest, etc
+    b) Generate HEC token 
+        indexes available = risk, notable
+        sourcetype = stash
+    c) Create ess configuration status
+    d) get that status #
+        |inputlookup reviewstatuses_lookup
+
+
+1) setup config.json
+2) use of backfill_test_filters.json if you want to limit to specific searches for testing runs
+3) grab splunk sdk
+    
+    #Put Splunk SDK in Script directory
+    wget https://github.com/splunk/splunk-sdk-python/archive/refs/heads/master.zip
+    unzip master.zip
+    mv splunk-sdk-python-master/splunklib/ ./
+    rm splunk-sdk-python-master/ -R
+    rm master.zip
+4) to run the script use:
+    /opt/splunk/bin/splunk cmd python3 backfill.py
+
+
+
+Validating Events in index
+    index=notable <backfillkey> {Last 24 hours}
+    index=risk <backfillkey> {All TIME} or {a time window around the backfill window set in the config.json}
+
+Validating Notables in Incident Review
+    Go to ES / Incident Review
+    Search for title "BACKFILL"
+
+Validating Notables in Incident Review after status update
+    Go to ES / Incident Review
+    Search for title "BACKFILL"
+    Verify status is what was set in config.json
