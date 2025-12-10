@@ -1,14 +1,14 @@
 {
     "SPLUNK_SERVER": "https://localhost:8089",
     "SPLUNK_USER": "test",
-    "SPLUNK_PASS": "test",
     "BACKFILL_START": "1764952230",
     "BACKFILL_END": "1764980230",
-    "SEARCH_WINDOW_SECONDS": "2400",
-    "CORRELATION_SEARCH_FILTER": "action.correlationsearch.label=* disabled=0 action.correlationsearch.enabled=1",
+    "CORRELATION_SEARCH_FILTER": "action.correlationsearch.label=Yuri* disabled=0 action.correlationsearch.enabled=1",
     "LOGGING_LEVEL": "DEBUG",
     "DEBUG_LEVEL": 1,
+    "LOG_DIRECTORY": "./logs",
+    "EVENTS_DIRECTORY": "./events",
+    "TEST_DIRECTORY": "./test",
     "NOTABLE_STATUS_UPDATE": "6",
-    "HEC_URL": "https://localhost:8088/services/collector/event",
-    "HEC_TOKEN": "token"
+    "HEC_URL": "https://localhost:8088/services/collector/event"
 }
