@@ -5,6 +5,7 @@ Splunk configs to do
     b) Generate HEC token 
         indexes available = risk, notable
         sourcetype = stash
+        make sure its enabled!!!
     c) Create ess configuration status
     d) get that status #
         |inputlookup reviewstatuses_lookup
