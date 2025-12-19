@@ -173,6 +173,43 @@ def get_secret(secret_cfg):
 
     raise RuntimeError(f"Secret {realm}:{username} not found in storage/passwords")
 
+def handle_401(url, username_label):
+    msg = (
+        f"[ERROR] Received HTTP 401 (Unauthorized) from Splunk for user '{username_label}'.\n"
+        f"        URL: {url}\n"
+        "        Restart script to re-enter correct pw.\n"
+    )
+    logging.error(msg)
+    print("\n" + msg + "\n")
+
+def validate_splunk_user_auth() -> bool:
+    """
+    Validate the stored SPLUNK_USER credentials by calling /services/authentication/current-context.
+    Returns True on success, False on auth/other failure.
+    """
+    user, pw = get_splunk_auth()
+    url = f"{SPLUNK_SERVER}/services/authentication/current-context"
+    params = {"output_mode": "json"}
+
+    try:
+        r = requests.get(url, auth=(user, pw), params=params, verify=False, timeout=10)
+        if r.status_code == 401:
+            logging.error(
+                f"Splunk REST auth failed (HTTP 401) for user '{user}'. "
+                "Restart script and enter correct credentials."
+            )
+            return False
+        if not r.ok:
+            logging.error(
+                f"Splunk REST auth validation returned HTTP {r.status_code}: {r.text[:400]}"
+            )
+            return False
+        logging.info("Splunk REST user authentication validated successfully.")
+        return True
+    except requests.RequestException as e:
+        logging.error(f"Splunk REST auth validation error at '{url}': {e}")
+        return False
+
 # ==============================================================
 # Define Configurations
 # ==============================================================
@@ -229,6 +266,19 @@ def risk_events_txt_path(backfill_key: str, mode: str = "full") -> str:
 def window_log_path(backfill_key: str, mode: str = "full") -> str:
     base_dir = LOG_DIR
     return os.path.join(base_dir, f"backfill_window_log_{backfill_key}.csv")
+
+def risk_notable_events_txt_path(backfill_key: str) -> str:
+    base_dir = _events_dir_for_mode("full")
+    return os.path.join(base_dir, f"notable_events_risk_{backfill_key}.txt")
+
+def risk_risk_events_txt_path(backfill_key: str) -> str:
+    base_dir = _events_dir_for_mode("full")
+    return os.path.join(base_dir, f"risk_events_risk_{backfill_key}.txt")
+
+def risk_backfill_events_path(backfill_key: str, mode: str = "full") -> str:
+    base_dir = _events_dir_for_mode(mode)
+    return os.path.join(base_dir, f"backfill_events_risk_{backfill_key}.json")
+
 
 #define global for fallback behavior
 global POINTER_FILE,BACKFILL_EVENTS_FILE,ACTIVE_SEARCHES_FILE,RISK_EVENTS_FILE,NOTABLE_EVENTS_TXT,RISK_EVENTS_TXT
@@ -335,6 +385,11 @@ STATIC_SEARCH_NAME_ALLOWLIST = load_allowlist_from_file(
     STATIC_FILTER_CONFIG, label="backfill_static_filters.json"
 )
 
+
+RISK_SEARCH_NAME_ALLOWLIST = load_allowlist_from_file(
+    RISK_FILTER_CONFIG, label="backfill_risk_searches_filters.json"
+)
+
 def static_active_searches_path(backfill_key: str, mode: str = "full") -> str:
     base_dir = _events_dir_for_mode(mode)
     return os.path.join(base_dir, f"static_correlation_searches_{backfill_key}.json")
@@ -365,6 +420,9 @@ def splunk_request(method, endpoint, params=None, data=None, headers=None):
         debug(f"Response status: {response.status_code}", level=1)
         if response.status_code != 200:
             logging.error(f"API error: {response.text}")
+        if response.status_code == 401:
+            handle_401(url, user)
+            return None
         return response
     except Exception as e:
         logging.error(f"Request error for {url}: {e}")
@@ -420,7 +478,7 @@ def parse_relative_time_spec(spec):
 def init_window_log(path):
     if not os.path.exists(path):
         with open(path, "w") as f:
-            f.write("search_name,window_start,window_end,results_returned,per_search_window_seconds\n")
+            f.write("search_number,search_name,window_start,window_end,results_returned,per_search_window_seconds\n")
 
 # # # # ===============================
 # # # # Determine Search windows
@@ -687,12 +745,16 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
 
     #flag for test run to check for some logging
     is_test_run = (pointer_file == TEST_POINTER_FILE)
+    if mode == "risk":
+        total_searches = len(RISK_SEARCH_NAME_ALLOWLIST)
+    else:
+        total_searches = len(searches)
 
     for idx, s in enumerate(searches[last_index:], start=last_index):
         content = s.get("content", {})
         search_name = s.get("name")
         rule_title =  content.get("action.correlationsearch.label")
-
+             
         # Determine mode based on which pointer file you're using
         is_test_run = (pointer_file == TEST_POINTER_FILE)
 
@@ -707,6 +769,28 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
         if allowlist:
             if (search_name not in allowlist) and (rule_title not in allowlist):
                 continue
+        
+        # In full mode, explicitly exclude risk searches defined in backfill_risk_searches_filters.json
+        if mode == "full" and RISK_SEARCH_NAME_ALLOWLIST:
+            if (search_name in RISK_SEARCH_NAME_ALLOWLIST) or (rule_title in RISK_SEARCH_NAME_ALLOWLIST):
+                logging.info(
+                    f"Skipping risk search '{search_name}'/'{rule_title}' in full backfill "
+                    f"because it is listed in backfill_risk_searches_filters.json."
+                )
+                #Log a skipped window entry for traceability
+                try:
+                    if BACKFILL_WINDOW_LOG:
+                        with open(BACKFILL_WINDOW_LOG, "a") as f:
+                            # Use empty timestamps and 0 results; you can adjust the marker string if you prefer
+                            f.write(
+                                f'"{idx+1} of {total_searches}",'
+                                f'"{rule_title or search_name}",'
+                                f',,0,SKIPPED_RISK\n'
+                            )
+                except Exception as e:
+                    logging.warning(f"Failed to write SKIPPED_RISK window log entry: {e}")
+
+                continue
 
         # always start at 0 per search
         local_breaker = 0
@@ -719,6 +803,8 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
             or s.get("content", {}).get("action.correlationsearch.label") \
             or s.get("name", "Unknown Search")
         
+        logging.info(f"Starting backfill search for search # {idx + 1} of {total_searches}: {current_search_name}")
+
         content = s.get("content", {})
 
         disp_earliest = content.get("dispatch.earliest_time")
@@ -821,8 +907,10 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                                 human_end = datetime.utcfromtimestamp(window_end).isoformat()
                                 with open(BACKFILL_WINDOW_LOG, "a") as f:
                                     f.write(
+                                        f'"{idx+1} of {total_searches}",'
                                         f'"{current_search_name}",'f"{human_start},{human_end},FAILED,{per_search_window}\n"
                                     )
+                            debug("Updated search windows log.",level=1)
                         except Exception as e:
                             logging.warning(f"Failed to write FAILED window log entry: {e}")
 
@@ -835,9 +923,10 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                             last_search_index=idx,
                             last_window_start=window_end,
                             pointer_file=pointer_file,
+                            status = "last window failed"
                         )
                         break
-                    time.sleep(5)
+                    time.sleep(2)
                 if job_failed:
                     local_breaker += 1
                     start_time = window_end
@@ -936,15 +1025,19 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                         human_end   = datetime.utcfromtimestamp(window_end).isoformat()
                         with open(BACKFILL_WINDOW_LOG, "a") as f:
                             f.write(
+                                f'"{idx+1} of {total_searches}",'
                                 f'"{current_search_name}",'
                                 f"{human_start},{human_end},{results_count},{per_search_window}\n"
                             )
+                        debug("Updated search windows log.",level=1)
                 except Exception as e:
                     logging.warning(f"Failed to write window log entry: {e}")
 
                 total_results_count = total_results_count + len(result_data)
-
-                # Update pointer after successful window
+                start_time = window_end
+                local_breaker += 1
+                
+                # Update pointer to the next window's start since the last one completed
                 upsert_run_record(
                     backfill_key=backfill_key,
                     mode=mode,
@@ -952,18 +1045,28 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                     backfill_end=backfill_end or BACKFILL_END,
                     last_search_index=idx,
                     last_window_start=start_time,
-                    pointer_file=pointer_file
+                    pointer_file=pointer_file,
+                    status = "next run"
                 )
                 logging.info(f"Pointer updated after successful window [{window_start}-{window_end}].")
 
             except Exception as e:
                 logging.error(f"Error processing search window {start_time}-{window_end}: {e}", exc_info=True)
                 break  # Stop current search loop if error
-            
-            start_time = window_end
-            local_breaker += 1
+
         
         #log end of current search results
+        # Mark this search as complete in the pointer so next resume starts at the next search
+        upsert_run_record(
+            backfill_key=backfill_key,
+            mode=mode,
+            backfill_start=BACKFILL_START,
+            backfill_end=backfill_end or BACKFILL_END,
+            last_search_index=idx + 1,     # advance to next search
+            last_window_start=BACKFILL_START,  # reset window for next search
+            pointer_file=pointer_file,
+            status="complete"
+        )
         logging.info(f"Backfill for {current_search_name} completed.  Total events: {total_results_count}")
 
 
@@ -1143,7 +1246,7 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
             risk_events.append(risk_event)
             total_risk_count += 1
 
-    # Write all risk events to file
+    # Write all risk events to json file
     try:
         with open(risk_file, "w") as f:
             json.dump(risk_events, f, indent=2)
@@ -1159,6 +1262,8 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
             return
     
     with open(textfile, "w") as out:
+        # Fields you do NOT want in the risk TXT output
+        exclude_fields = {"_time", "risk_a"}  # add others if needed
         for e in data:
             orig_time_str = e.get("orig_time")
             info_max_time = e.get("info_max_time")
@@ -1187,7 +1292,7 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
                 epoch_time = int(time.time())
 
             parts = [str(epoch_time)]
-            parts += [f'{k}="{v}"' for k, v in e.items() if k != "_time"]
+            parts += [f'{k}="{v}"' for k, v in e.items() if k not in exclude_fields]
             line = ", ".join(parts).replace("\\", "")
             out.write(line + "\n")
             
@@ -1352,6 +1457,7 @@ def get_backfill_key_from_pointer() -> str:
             last_search_index=0,
             last_window_start=BACKFILL_START,
             pointer_file=POINTER_FILE,
+            status = "first search"
         )
     else:
         # Existing key: just mark it active, do NOT reset
@@ -1461,7 +1567,7 @@ def assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=N
 
 def upsert_run_record(backfill_key, mode, backfill_start, backfill_end,
                       last_search_index=0, last_window_start=None,
-                      pointer_file=POINTER_FILE):
+                      pointer_file=POINTER_FILE, status="in_progress"):
     pointer_data = load_pointer(pointer_file)
     runs = pointer_data.get("runs", [])
 
@@ -1481,6 +1587,7 @@ def upsert_run_record(backfill_key, mode, backfill_start, backfill_end,
                 "last_search_index": last_search_index,
                 "last_window_start": last_window_start,
                 "updated_at": now_iso,
+                "status" : status
             })
             break
     else:
@@ -1492,7 +1599,19 @@ def upsert_run_record(backfill_key, mode, backfill_start, backfill_end,
             "backfill_end": backfill_end,
             "last_search_index": last_search_index,
             "last_window_start": last_window_start,
+            "status" : status
+
         })
+
+    # Debug log for pointer upsert
+    debug(
+        f"Pointer upsert for key='{backfill_key}': "
+        f"mode={mode}, status={status}, "
+        f"last_search_index={last_search_index}, last_window_start={last_window_start}, "
+        f"backfill_start={backfill_start}, backfill_end={backfill_end}, "
+        f"pointer_file='{pointer_file}' status= '{status}'",
+        level=2
+    )
 
     pointer_data["runs"] = runs
     pointer_data["active_backfill_key"] = backfill_key
@@ -1809,55 +1928,75 @@ def test_run():
 # Menu System
 # ===============================
 def menu():
-     global BACKFILL_KEY
-     resume_logging="\n\n##############################################\n#######################\n# Resume Logging\n#######################"
+    global BACKFILL_KEY
+    global BACKFILL_EVENTS_FILE, ACTIVE_SEARCHES_FILE, RISK_EVENTS_FILE
+    global NOTABLE_EVENTS_TXT, RISK_EVENTS_TXT, BACKFILL_WINDOW_LOG
+    global RISK_SEARCH_NAME_ALLOWLIST
+    resume_logging="\n\n##############################################\n#######################\n# Resume Logging\n#######################"
 
-     while True:
-        print("\n\n##############################################\n#######################\n# Main Menu\n#######################")
-        print("#\n# Welcome to Splunk Correlation Search Backfill Script!")
-        print("# This script currently outputs Notable Events with time the search ran (today), while Risk events are backdated to time of event\n#")
+    while True:
+        print("\n" + "#" * 46)
+        print("#######################")
+        print("# Main Menu")
+        print("#######################")
+        print("#")
+        print("# Welcome to Splunk Correlation Search Backfill Script!")
+        print("# This script outputs Notable Events at run time (today)")
+        print("# while Risk events are backdated to the original event time.")
+        print("#")
         print(f"# Current backfill identifier: {BACKFILL_KEY}")
-        print("# a) Run All (b-g)")
+        print("#")
+
+        print("#######################")
+        print("# Authentication")
+        print("#######################")
+        print("# a) Check Authentication")
+
+        print("#")
+        print("#######################")
+        print("# Primary Functions (recommended order)")
+        print("#######################")
         print("# b) Get Active Searches")
-        print("# c) Start Backfill")
-        print("# d) Generate Notable Events")
-        print("# e) Generate Risk Events")
+        print("# c) Run Searches to generate results (non-risk searches)")
+        print("# d) Generate Notable Events from results")
+        print("# e) Generate Risk Score Events from results")
         print("# f) Ingest Notable events")
-        print("# g) Ingest Risk events")
+        print("# g) Ingest Risk Score events")
+        print("# h) Run Risk searches and generate notable/risk events")
+        print("# i) Ingest Notable and Risk events for Risk searches")
 
-        print("#\n#######################\n# Update after verification of events in Analyst queue: \n#######################")
-        print("# h) Bulk Update Notable Event status")
+        print("#")
+        print("#######################")
+        print("# Post-Verification Actions")
+        print("#######################")
+        print("# j) Bulk Update Notable Event status")
 
-        print("#\n#######################\n# Additional Options: \n#######################")
-        print("# i) Change Backfill Identifier")
-        print("# r) Restart Backfill from Pointer - you will need to run d, e, f, g, and h manually afterwards.")
-        print("# k) Rerun backfill for Risk Searches only, and upload")
-               
-        print("#\n#######################\n# Testing Option: \n#######################")
-        print("# t) Test Run - Get - (get all searches defined in filter OR only retrieve the first 3 searches backfill and use 2 search windows only)")
-        print("# u) Test Run - Push - (push results from test run to Splunk, and update event status for these)")
+        print("#")
+        print("#######################")
+        print("# Additional Options")
+        print("#######################")
+        print("# n) Change Backfill Run Identifier")
+        print("# o) Show last search status for current identifier")
+        print("# r) Restart Searches from Pointer")
 
-        print("#\n#######################\n# EXIT \n#######################")
-        print("# x) To Exit Script")
-        print("\n\n##############################################\n")
+        print("#")
+        print("#######################")
+        print("# Testing")
+        print("#######################")
+        print("# t) Test Run - Get (filtered searches, limited windows)")
+        print("# u) Test Run - Push (ingest test run results and update status)")
+
+        print("#")
+        print("#######################")
+        print("# Exit")
+        print("#######################")
+        print("# x) Exit Script")
+        print("#" * 46 + "\n")
+
         choice = input("Select an option: ").lower()
 
         if choice == 'a':
-            print(resume_logging)
-            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
-                continue
-            get_active_correlation_searches(active_search_filter=CORRELATION_SEARCH_FILTER)
-            init_window_log(BACKFILL_WINDOW_LOG)
-            run_backfill(backfill_key=BACKFILL_KEY)
-            generate_notable_events(textfile=NOTABLE_EVENTS_TXT,events_file=BACKFILL_EVENTS_FILE)
-            generate_risk_events(textfile=RISK_EVENTS_TXT,events_file=BACKFILL_EVENTS_FILE)
-    
-            # Skip ingest if no notables file or empty
-            if not (NOTABLE_EVENTS_TXT and os.path.exists(NOTABLE_EVENTS_TXT) and os.path.getsize(NOTABLE_EVENTS_TXT) > 0):
-                logging.info("No notable events generated; skipping ingest_notables and ingest_risk.")
-            else:
-                ingest_notables(file_path=NOTABLE_EVENTS_TXT, backfill_key=BACKFILL_KEY)
-                ingest_risk(file_path=RISK_EVENTS_TXT, backfill_key=BACKFILL_KEY)
+            validate_splunk_user_auth()
         
         elif choice == 'b':
             print(resume_logging)
@@ -1870,21 +2009,40 @@ def menu():
             if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
                 continue
             init_window_log(BACKFILL_WINDOW_LOG)
-            run_backfill(backfill_key=BACKFILL_KEY)
-       
-        elif choice == 'r':
-            print(resume_logging)
-            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
-                continue
-            run_backfill(backfill_key=BACKFILL_KEY)
+            run_backfill(backfill_key=BACKFILL_KEY,mode="full")
 
-        elif choice == 'k':
+        elif choice == 'd':
             print(resume_logging)
             if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
                 continue
+            generate_notable_events()
+        elif choice == 'e':
+            print(resume_logging)
+            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
+                continue
+            generate_risk_events()
+        elif choice == 'f':
+            print(resume_logging)
+            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
+                continue
+            ingest_notables(file_path=NOTABLE_EVENTS_TXT, backfill_key=BACKFILL_KEY)
+        elif choice == 'g':
+            print(resume_logging)
+            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
+                continue
+            ingest_risk(file_path=RISK_EVENTS_TXT, backfill_key=BACKFILL_KEY)
+    
+        elif choice == 'h':
+            print(resume_logging)
+            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
+                continue
+
+            # Build risk-only filenames
+            BACKFILL_EVENTS_FILE = risk_backfill_events_path(BACKFILL_KEY, mode="risk")
+            NOTABLE_EVENTS_TXT = risk_notable_events_txt_path(BACKFILL_KEY)
+            RISK_EVENTS_TXT    = risk_risk_events_txt_path(BACKFILL_KEY)
+
             # Use previously generated backfill_risk_searches_filters.json to run only those searches backfill.
-            global RISK_SEARCH_NAME_ALLOWLIST
-            RISK_SEARCH_NAME_ALLOWLIST = load_allowlist_from_file(RISK_FILTER_CONFIG, label="backfill_risk_searches_filters.json")
             if not RISK_SEARCH_NAME_ALLOWLIST:
                 logging.info("Risk allowlist is empty; no risk searches to backfill.")
             else:
@@ -1892,16 +2050,76 @@ def menu():
                     f"Backfilling only these risk searches: "
                     f"{sorted(RISK_SEARCH_NAME_ALLOWLIST)}"
                 )
+
             init_window_log(BACKFILL_WINDOW_LOG)
-            run_backfill(backfill_key=BACKFILL_KEY,pointer_file=RISK_POINTER_FILE, mode="risk")
-            generate_notable_events(textfile=NOTABLE_EVENTS_TXT,events_file=BACKFILL_EVENTS_FILE)
-            generate_risk_events(textfile=RISK_EVENTS_TXT,events_file=BACKFILL_EVENTS_FILE)
+            run_backfill(backfill_key=BACKFILL_KEY, pointer_file=RISK_POINTER_FILE, mode="risk")
+            generate_notable_events(textfile=NOTABLE_EVENTS_TXT, events_file=BACKFILL_EVENTS_FILE)
+            generate_risk_events(textfile=RISK_EVENTS_TXT, events_file=BACKFILL_EVENTS_FILE)
+
+        elif choice == 'i':
+            BACKFILL_EVENTS_FILE = risk_backfill_events_path(BACKFILL_KEY, mode="risk")
+            NOTABLE_EVENTS_TXT = risk_notable_events_txt_path(BACKFILL_KEY)
+            RISK_EVENTS_TXT    = risk_risk_events_txt_path(BACKFILL_KEY)
             if not (NOTABLE_EVENTS_TXT and os.path.exists(NOTABLE_EVENTS_TXT) and os.path.getsize(NOTABLE_EVENTS_TXT) > 0):
                 logging.info("No notable events generated; skipping ingest_notables and ingest_risk.")
             else:
                 ingest_notables(file_path=NOTABLE_EVENTS_TXT, backfill_key=BACKFILL_KEY)
                 ingest_risk(file_path=RISK_EVENTS_TXT, backfill_key=BACKFILL_KEY)
                 logging.info(f"Please verify new risk notables and events uploaded to Splunk and then run status update for:{BACKFILL_KEY}.")
+        
+        elif choice == 'j':
+            print(resume_logging)
+            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
+                continue
+            update_notable_status(backfill_key=BACKFILL_KEY)
+
+        elif choice == "n":
+            print("##############################################")
+            print("############ Change Backfill Identifier ############")
+            BACKFILL_KEY = get_backfill_key_from_pointer()
+
+        elif choice == 'o':
+            # Show current search status for the active BACKFILL_KEY
+            pointer_file = POINTER_FILE  # or TEST_POINTER_FILE if you want to branch
+            pointer_data = load_pointer(pointer_file)
+            runs = pointer_data.get("runs", [])
+            run_record = next((r for r in runs if r.get("backfill_key") == BACKFILL_KEY), None)
+
+            if not run_record:
+                print(f"No run record found for backfill_key='{BACKFILL_KEY}' in {pointer_file}")
+            else:
+                idx = run_record.get("last_search_index", 0)
+                last_window = run_record.get("last_window_start", BACKFILL_START)
+                status = run_record.get("status", "unknown")
+                mode = run_record.get("mode", "full")
+
+                print("######## Current Pointer Status ########")
+                print(f"Backfill key      : {BACKFILL_KEY}")
+                print(f"Mode              : {mode}")
+                print(f"Status            : {status}")
+                print(f"Last search index : {idx}")
+                print(f"Last window start : {last_window} "
+                    f"({datetime.utcfromtimestamp(last_window)} UTC)")
+                # Try to resolve next search name
+                try:
+                    with open(ACTIVE_SEARCHES_FILE) as f:
+                        searches = json.load(f)
+                    if 0 <= idx < len(searches):
+                        next_search = searches[idx].get("content", {}).get(
+                            "action.correlationsearch.label",
+                            searches[idx].get("name", "Unknown Search")
+                        )
+                    else:
+                        next_search = "None (index beyond list)"
+                except Exception:
+                    next_search = "Unknown (could not load active searches)"
+                print(f"Next search name  : {next_search}")
+       
+        elif choice == 'r':
+            print(resume_logging)
+            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
+                continue
+            run_backfill(backfill_key=BACKFILL_KEY)
             
         elif choice == 't':
             print(resume_logging)
@@ -1935,37 +2153,6 @@ def menu():
                 update_notable_status(backfill_key=test_key)
             else:
                 print("No test run found. Please run 't' first.")
-
-        elif choice == 'd':
-            print(resume_logging)
-            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
-                continue
-            generate_notable_events()
-        elif choice == 'e':
-            print(resume_logging)
-            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
-                continue
-            generate_risk_events()
-        elif choice == 'f':
-            print(resume_logging)
-            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
-                continue
-            ingest_notables(file_path=NOTABLE_EVENTS_TXT, backfill_key=BACKFILL_KEY)
-        elif choice == 'g':
-            print(resume_logging)
-            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
-                continue
-            ingest_risk(file_path=RISK_EVENTS_TXT, backfill_key=BACKFILL_KEY)
-        elif choice == 'h':
-            print(resume_logging)
-            if is_test_pointer(BACKFILL_KEY, "menu option 'a'"):
-                continue
-            update_notable_status(backfill_key=BACKFILL_KEY)
-
-        elif choice == "i":
-            print("##############################################")
-            print("############ Change Backfill Identifier ############")
-            BACKFILL_KEY = get_backfill_key_from_pointer()
 
         elif choice == 'x':
             print("Exiting script.")
