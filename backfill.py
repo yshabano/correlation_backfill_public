@@ -240,9 +240,10 @@ os.makedirs(TEST_DIR, exist_ok=True)
 # ==============================================================
 def _events_dir_for_mode(mode: str) -> str:
     """
-    Full runs write JSON/TXT under EVENTS_DIR, tests under TEST_DIR.
+    Full and risk runs write JSON/TXT under EVENTS_DIR, tests under TEST_DIR.
     """
-    return EVENTS_DIR if mode == "full" else TEST_DIR
+    return EVENTS_DIR if mode in ("full", "risk") else TEST_DIR
+
 def backfill_events_path(backfill_key: str, mode: str = "full") -> str:
     base_dir = _events_dir_for_mode(mode)
     return os.path.join(base_dir, f"backfill_events_{backfill_key}.json")
@@ -291,6 +292,8 @@ RISK_EVENTS_FILE = None
 NOTABLE_EVENTS_TXT = None
 RISK_EVENTS_TXT = None
 BACKFILL_WINDOW_LOG = None
+
+LAST_MENU_CHOICE = None
 
 # File Names for Testing
 TEST_POINTER_FILE = os.path.join(LOG_DIR,"test_backfill_pointer.json")
@@ -453,6 +456,35 @@ def splunk_request(method, endpoint, params=None, data=None, headers=None):
         logging.error(f"Request error for {url}: {e}")
         return None
     
+# # # # ===============================
+# # # # variable replacements for titles
+# # # # ===============================
+VAR_PATTERN = re.compile(r"\$([^$]+)\$")
+
+def expand_rule_title_placeholders(raw_title, event):
+    """
+    Replace any $field$ in rule_title with event[field] if present.
+    If the field is missing, leave the token as-is (or set to "" if preferred).
+    """
+    if not isinstance(raw_title, str):
+        return raw_title
+
+    def repl(match):
+        field = match.group(1)  # text between the $...$
+        # Try exact field name first
+        if field in event:
+            return str(event[field])
+        # Optionally support common lower/upper variants
+        lower = field.lower()
+        for k, v in event.items():
+            if k.lower() == lower:
+                return str(v)
+        # If no match, either return empty string or keep original token
+        # return ""          # uncomment to blank unknown tokens
+        return match.group(0)  # keep $field$ if not found
+
+    return VAR_PATTERN.sub(repl, raw_title)
+
 # # # # ===============================
 # # # # Manage Time Functions
 # # # # ===============================
@@ -644,12 +676,6 @@ def get_active_correlation_searches(active_search_filter):
         content = entry.get("content", {})
         if content.get("disabled") == 1:
             continue
-        
-        search_name = entry.get("name")
-        rule_title = (
-            content.get("action.notable.param.rule_title")
-            or content.get("action.correlationsearch.label")
-        )
 
         filtered_data = {k: v for k, v in content.items() if k in [
             "action.correlationsearch.enabled",
@@ -674,9 +700,10 @@ def get_active_correlation_searches(active_search_filter):
             "action.correlationsearch.annotations",
             "dispatch.earliest_time",
             "dispatch.latest_time",
-            "cron_schedule"
+            "cron_schedule",
+            "title"
         ]}
-        filtered_data["Updated Title"] = f"BACKFILL - {content.get('action.correlationsearch.label')}"
+        filtered_data["Updated Title"] = f"BACKFILL - {content.get('action.notable.param.rule_title')}"
         modified_search = content.get("search", "")
         modified_search = modified_search.replace("summariesonly=true", "summariesonly=false")
         modified_search = modified_search.replace("summariesonly=t", "summariesonly=false")
@@ -778,7 +805,7 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
     for idx, s in enumerate(searches[last_index:], start=last_index):
         content = s.get("content", {})
         search_name = s.get("name")
-        rule_title =  content.get("action.correlationsearch.label")
+        search_title =  content.get("action.correlationsearch.label")
              
         # Determine mode based on which pointer file you're using
         is_test_run = (pointer_file == TEST_POINTER_FILE)
@@ -792,14 +819,14 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
             allowlist = BACKFILL_SEARCH_NAME_ALLOWLIST
 
         if allowlist:
-            if (search_name not in allowlist) and (rule_title not in allowlist):
+            if (search_name not in allowlist) and (search_title not in allowlist):
                 continue
         
         # In full mode, explicitly exclude risk searches defined in backfill_risk_searches_filters.json
         if mode == "full" and RISK_SEARCH_NAME_ALLOWLIST:
-            if (search_name in RISK_SEARCH_NAME_ALLOWLIST) or (rule_title in RISK_SEARCH_NAME_ALLOWLIST):
+            if (search_name in RISK_SEARCH_NAME_ALLOWLIST) or (search_title in RISK_SEARCH_NAME_ALLOWLIST):
                 logging.info(
-                    f"Skipping risk search '{search_name}'/'{rule_title}' in full backfill "
+                    f"Skipping risk search '{search_name}'/'{search_title}' in full backfill "
                     f"because it is listed in backfill_risk_searches_filters.json."
                 )
                 #Log a skipped window entry for traceability
@@ -809,7 +836,7 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                             # Use empty timestamps and 0 results; you can adjust the marker string if you prefer
                             f.write(
                                 f'"{idx+1} of {total_searches}",'
-                                f'"{rule_title or search_name}",'
+                                f'"{search_title or search_name}",'
                                 f',,0,SKIPPED_RISK\n'
                             )
                 except Exception as e:
@@ -1019,7 +1046,7 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                     r["rule_title"] = content.get("Updated Title")
                     r["orig_rule_title"] = content.get("action.correlationsearch.label")
                     r["severity"] = content.get("action.notable.param.severity", "unknown")
-                    r["search_name"] = content.get("action.notable.param.rule_title", "N/A")
+                    r["search_name"] = search_name
                     r["security_domain"] = content.get("action.notable.param.security_domain", "")
                     r["annotations"] = content.get("action.correlationsearch.annotations", "")
                     r["risk_val"] = content.get("action.risk.param._risk", "FALSE")
@@ -1030,7 +1057,7 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                     for field in ["_bkt","_cd","_indextime","_time", "_kv", "_raw", "_serial", "_si", "_sourcetype", "_subsecond", "linecount", "splunk_server","host", "index","source","sourcetype"]:
                         r.pop(field, None)
 
-                # Append all results to global backfill file
+                # Append all results to backfill file
 
                 if result_data:
                     append_to_backfill_file(result_data, events_file)
@@ -1142,6 +1169,10 @@ def generate_notable_events(textfile=None, events_file=None):
             # First column: epoch time (prefer _time, fall back to orig_time, then now)
             ts = e.get("_time", e.get("orig_time", int(time.time())))
             parts = [str(ts)]
+        
+            # Expand any $field$ variables in rule_title
+            if "rule_title" in e:
+                e["rule_title"] = expand_rule_title_placeholders(e["rule_title"], e)
 
             kv_pairs = []
             for k, v in e.items():
@@ -1207,6 +1238,10 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
             risk_object_type = risk_obj.get("risk_object_type", "unknown")
             risk_score = risk_obj.get("risk_score", 0)
 
+            # Skip noise: empty object field/type and score == 1
+            if (not risk_object_field) and (not risk_object_type) and int(risk_score) == 1:
+                continue
+
             # Use event's original field value as the risk_object
             risk_object_value = event.get(risk_object_field, None)
             if risk_object_value is None:
@@ -1239,13 +1274,19 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
                 ### NEED TO ADD LOGIC FOR RISK SCORE TYPE
                 "risk_message": risk_message,
                 "contributing_events_search": contributing_events_search,
-                "backfill_identifier": backfill_key
+                "backfill_identifier": backfill_key,
+                "search_name" : search_name
             }
-
             # Add all original event fields except risk_val
             for k, v in event.items():
                 if k != "risk_val":
                     risk_event[k] = v
+            
+            # Expand any $field$ variables in rule_title for risk events as well
+            if "risk_message" in risk_event:
+                risk_event["risk_message"] = expand_rule_title_placeholders(
+                    risk_event["risk_message"], risk_event
+                )
 
             # Set _time from orig_time if present, else from info_max_time, else leave as current time
             orig_time_str = event.get("orig_time")
@@ -1399,7 +1440,7 @@ def get_static_correlation_searches(backfill_key: str, mode: str = "full"):
             "dispatch.latest_time",
             "cron_schedule"
         ]}
-        filtered_data["Updated Title"] = f"BACKFILL - {content.get('action.correlationsearch.label')}"
+        filtered_data["Updated Title"] = f"BACKFILL - {content.get('    ')}"
         modified_search = content.get("search", "")
         modified_search = modified_search.replace("summariesonly=true", "summariesonly=false")
         modified_search = modified_search.replace("summariesonly=t", "summariesonly=false")
@@ -1586,12 +1627,17 @@ def assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=N
             raise ValueError(f"Could not read TXT from {txt_path}: {e}")
 
     if not found:
-        raise ValueError(
-            f"backfill_key '{backfill_key}' NOT FOUND in files: {json_path if json_path else ''}, {txt_path if txt_path else ''}\n"
-            "Aborting ingest/update to prevent accidental or mismatched action."
-        )
-    else:
-        logging.info(f"Detected backfill_key '{backfill_key}' in event files.")
+         logging.warning(
+            f"backfill_key '{backfill_key}' NOT FOUND in files: "
+            f"{json_path or ''}, {txt_path or ''}. "
+            "Skipping ingest/update to prevent accidental or mismatched action."
+            )
+         return False
+
+    logging.info(
+        f"Detected backfill_key '{backfill_key}' in event files."
+    )
+    return True
 
 def upsert_run_record(backfill_key, mode, backfill_start, backfill_end,
                       last_search_index=0, last_window_start=None,
@@ -1649,7 +1695,13 @@ def upsert_run_record(backfill_key, mode, backfill_start, backfill_end,
 # Upload Notable events, and change their status to specified value
 # ===============================
 def ingest_notables(file_path,backfill_key):
-    assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=file_path)
+    if not assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=file_path):
+        logging.info(
+            "Skipping notable ingest for backfill_key '%s' because it was not found in %s",
+            backfill_key,
+            file_path,
+        )
+        return
     hec_url = config.get("HEC_URL")
     if not hec_url:
         logging.error("HEC_URL is not set in config.json; aborting notable ingest.")
@@ -1668,7 +1720,16 @@ def ingest_notables(file_path,backfill_key):
 # Upload Risk events
 # ===============================
 def ingest_risk(file_path,backfill_key):
-    assert_backfill_key_present_in_file(backfill_key, json_path=None, txt_path=file_path)
+    if not assert_backfill_key_present_in_file(
+        backfill_key, json_path=None, txt_path=file_path
+    ):
+        # Just log and return to menu
+        logging.info(
+            "Skipping risk ingest for backfill_key '%s' because it was not found in %s",
+            backfill_key,
+            file_path,
+        )
+        return
     """
     Ingest a file of risk events into Splunk using HEC, using the first field as event time.
     Each line format:
@@ -1960,10 +2021,14 @@ def menu():
     global BACKFILL_EVENTS_FILE, ACTIVE_SEARCHES_FILE, RISK_EVENTS_FILE
     global NOTABLE_EVENTS_TXT, RISK_EVENTS_TXT, BACKFILL_WINDOW_LOG
     global RISK_SEARCH_NAME_ALLOWLIST
+    global LAST_MENU_CHOICE
     resume_logging="\n\n##############################################\n#######################\n# Resume Logging\n#######################"
 
     while True:
         print("\n" + "#" * 46)
+        if LAST_MENU_CHOICE:
+            print(f"# Last choice run: '{LAST_MENU_CHOICE}'")
+            print("#")
         print("#######################")
         print("# Main Menu")
         print("#######################")
@@ -2027,6 +2092,7 @@ def menu():
         print("#" * 46 + "\n")
 
         choice = input("Select an option: ").lower()
+        LAST_MENU_CHOICE = choice
 
         if choice == 'a':
             validate_splunk_user_auth()
@@ -2091,7 +2157,7 @@ def menu():
                     f"{sorted(RISK_SEARCH_NAME_ALLOWLIST)}"
                 )
             init_window_log(BACKFILL_WINDOW_LOG)
-            run_backfill(backfill_key=BACKFILL_KEY, pointer_file=RISK_POINTER_FILE, mode="risk")
+            run_backfill(backfill_key=BACKFILL_KEY, pointer_file=RISK_POINTER_FILE, events_file=BACKFILL_EVENTS_FILE,mode="risk")
 
         elif choice == 'i':
             print(resume_logging)
