@@ -38,3 +38,8 @@ Validating Notables in Incident Review after status update
     Go to ES / Incident Review
     Search for title "BACKFILL"
     Verify status is what was set in config.json
+
+
+WARNING:  For notable events due to the source being set to backfill_ for notables, certain aspects of the 
+Incident Viewer may not display properly. Known things such as Drilldown Searches, or Drilldown dashboards.  
+This can be manually done by going to the correlation search and copying the search and manually setting the variables.
