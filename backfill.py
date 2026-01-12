@@ -1051,7 +1051,7 @@ def run_backfill(backfill_key=None, pointer_file=None, events_file=None, active_
                     r["annotations"] = content.get("action.correlationsearch.annotations", "")
                     r["risk_val"] = content.get("action.risk.param._risk", "FALSE")
                     r["risk_message"] = content.get("action.risk.param._risk_message", "")
-                    r["risk_a"] = content.get("action.risk", "")
+                    r["risk_action_flag"] = content.get("action.risk", "")
                     r["backfill_identifier"] = backfill_key
 
                     for field in ["_bkt","_cd","_indextime","_time", "_kv", "_raw", "_serial", "_si", "_sourcetype", "_subsecond", "linecount", "splunk_server","host", "index","source","sourcetype"]:
@@ -1162,7 +1162,7 @@ def generate_notable_events(textfile=None, events_file=None):
             "linecount",
             "splunk_server",
             "info_window_size",
-            "risk_a",
+            "risk_action_flag",
         }
 
         for e in data:
@@ -1223,23 +1223,34 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
     for event in backfill_data:
         risk_val = event.get("risk_val")
 
+        risk_action_flag = event.get("risk_action_flag", 0)
+
         # Skip if no valid risk structure
-        if not risk_val or risk_val == "FALSE":
-            continue
+        try:
+            risk_action_int = int(risk_action_flag)
+        except (TypeError, ValueError):
+            risk_action_int = 0
 
         try:
             risk_objects = json.loads(risk_val)
         except Exception as e:
             logging.warning(f"Invalid JSON in risk_val for event: {e}")
             continue
+        
+        #get risk_action_flag from event, and if NONE use 0
+        risk_action_flag = event.get("risk_action_flag", 0)
 
         for risk_obj in risk_objects:
             risk_object_field = risk_obj.get("risk_object_field")
             risk_object_type = risk_obj.get("risk_object_type", "unknown")
             risk_score = risk_obj.get("risk_score", 0)
+            search_name = event.get("search_name", "Unknown Search")
 
-            # Skip noise: empty object field/type and score == 1
-            if (not risk_object_field) and (not risk_object_type) and int(risk_score) == 1:
+            # Skip noise:
+            #  - empty object field/type and score == 1
+            #  - OR risk_action_flag == 0 
+            debug(f"Risk action flag for {search_name} is {risk_action_int}",2)
+            if (((not risk_object_field) and (not risk_object_type) and int(risk_score) == 1) or int(risk_action_int) == 0):
                 continue
 
             # Use event's original field value as the risk_object
@@ -1259,7 +1270,6 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
                 risk_message = "Asset has added risk"
 
             # Construct contributing_events_search string
-            search_name = event.get("search_name", "Unknown Search")
             contributing_events_search = (
                 f'| savedsearch "{search_name}" | search {risk_object_field}={risk_object_value}'
             )
@@ -1333,7 +1343,7 @@ def generate_risk_events(textfile=None, events_file=None, risk_file=None,backfil
     
     with open(textfile, "w") as out:
         # Fields you do NOT want in the risk TXT output
-        exclude_fields = {"_time", "risk_a"}  # add others if needed
+        exclude_fields = {"_time", "risk_action_flag"}  # add others if needed
         for e in data:
             orig_time_str = e.get("orig_time")
             info_max_time = e.get("info_max_time")
